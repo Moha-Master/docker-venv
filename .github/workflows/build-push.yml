@@ -1,0 +1,267 @@
+name: build-push-acr
+
+# 镜像唯一构建入口：推 main 或手动触发 → 动态矩阵并行构建 → 推送 ACR
+# 采用 3 级配置合并：BASE_CONFIG <- BUILD_MATRIX (单个) <- OVERRIDE_CONFIG (强制覆盖)
+# 校验规则外置于 vars.BUILD_SCHEMA（JSON Schema，默认模板见 README）：
+# 单源校验管键名/类型/格式，跨源必填由"内置 6 键硬底线 + 合并后 schema 复校"共同裁决
+on:
+  push:
+    branches: [main]
+    paths:
+      - "Dockerfile"
+      - "config/**"
+      - "bin/**"
+      - ".github/workflows/build-push.yml"
+  workflow_dispatch: {}
+
+permissions:
+  contents: read
+
+concurrency:
+  group: build-push-acr
+  cancel-in-progress: false
+
+env:
+  BUILD_TIMEOUT_MINUTES: ${{ vars.BUILD_TIMEOUT_MINUTES || '60' }}
+
+jobs:
+  # ---- 1. 矩阵准备与严格校验 ----
+  prepare:
+    runs-on: ubuntu-latest
+    outputs:
+      matrix: ${{ steps.build-matrix.outputs.matrix }}
+    steps:
+      - name: Set up validator
+        run: |
+          set -eu
+          python3 -m venv /tmp/validator-venv
+          /tmp/validator-venv/bin/pip install --quiet 'check-jsonschema==0.38.2'
+
+      - name: Compute and Validate Build Matrix
+        id: build-matrix
+        env:
+          BUILD_SCHEMA: ${{ vars.BUILD_SCHEMA }}
+          OVERRIDE_CONFIG: ${{ vars.OVERRIDE_CONFIG }}
+          BUILD_MATRIX: ${{ vars.BUILD_MATRIX }}
+          BASE_CONFIG: ${{ vars.BASE_CONFIG }}
+          ACR_REGISTRY: ${{ vars.ACR_REGISTRY }}
+          ACR_NAMESPACE: ${{ vars.ACR_NAMESPACE }}
+        run: |
+          /tmp/validator-venv/bin/python - << 'PEOF'
+          import base64
+          import json
+          import os
+          import subprocess
+          import sys
+
+          SCHEMA_FILE = "/tmp/build-schema.json"           # 原始 schema：用于 schema 自检与"合并后"复校
+          SOURCE_SCHEMA_FILE = "/tmp/build-schema-source.json"  # 剥离 required 后的 schema：用于单源校验
+          REQUIRED_KEYS = ["name", "tag", "base_image", "dev_user", "dev_uid", "dev_gid"]
+          # 通过当前解释器以模块方式调用，不依赖 PATH（venv 绝对路径启动时 PATH 不含 bin）
+          VALIDATOR = [sys.executable, "-m", "check_jsonschema"]
+
+
+          def fail(lines):
+              for line in ([lines] if isinstance(lines, str) else lines):
+                  print(line, file=sys.stderr)
+              sys.exit(1)
+
+
+          def get(name):
+              return os.environ.get(name, "").strip()
+
+
+          def parse_json(raw, label):
+              try:
+                  return json.loads(raw)
+              except Exception as e:
+                  fail(f"❌ 错误：vars.{label} 不是合法 JSON：{e}")
+
+
+          def strip_required(node):
+              """递归剥离 required 关键字：单源校验只管键名/类型/格式，
+              跨源必填语义（如 base_image 来自 BASE_CONFIG、name/tag 来自矩阵项）由合并后复校裁决"""
+              if isinstance(node, dict):
+                  return {k: strip_required(v) for k, v in node.items() if k != "required"}
+              if isinstance(node, list):
+                  return [strip_required(v) for v in node]
+              return node
+
+
+          def validate_instance(obj, label, schema_file, idx=None):
+              """用 BUILD_SCHEMA 校验单个配置对象，未知键/类型/格式问题在这里中止"""
+              path = "/tmp/validate-target.json"
+              with open(path, "w") as f:
+                  json.dump(obj, f)
+              proc = subprocess.run(VALIDATOR + ["--schemafile", schema_file, path],
+                                    capture_output=True, text=True)
+              if proc.returncode != 0:
+                  loc = f"vars.{label}[{idx}]" if idx is not None else f"vars.{label}"
+                  fail([f"❌ 中止：{loc} 未通过 BUILD_SCHEMA 校验："]
+                       + (proc.stderr or proc.stdout).strip().splitlines())
+
+
+          registry, namespace = get("ACR_REGISTRY"), get("ACR_NAMESPACE")
+          if not registry or not namespace:
+              fail("❌ 错误：缺少 vars.ACR_REGISTRY 或 vars.ACR_NAMESPACE 变量，请在仓库设置中配置！")
+
+          schema_str = get("BUILD_SCHEMA")
+          if not schema_str:
+              fail("❌ 错误：缺少 vars.BUILD_SCHEMA 变量！校验规则已外置，请将 README 中的默认 schema 复制到仓库 Variables 后重试。")
+
+          matrix_str = get("BUILD_MATRIX")
+          if not matrix_str:
+              fail("❌ 错误：缺少 vars.BUILD_MATRIX 变量！必须在 GitHub Variables 中配置要构建的镜像矩阵。")
+
+          # 1. schema 自校验（Meta-Schema）：schema 自身写错时给出清晰错误，而不是下游诡异报错
+          schema_obj = parse_json(schema_str, "BUILD_SCHEMA")
+          if not isinstance(schema_obj, dict):
+              fail("❌ 错误：vars.BUILD_SCHEMA 必须是 JSON 对象！")
+          with open(SCHEMA_FILE, "w") as f:
+              f.write(schema_str)
+          proc = subprocess.run(VALIDATOR + ["--check-metaschema", SCHEMA_FILE],
+                                capture_output=True, text=True)
+          if proc.returncode != 0:
+              fail(["❌ 中止：vars.BUILD_SCHEMA 本身不是合法的 JSON Schema："]
+                   + (proc.stderr or proc.stdout).strip().splitlines())
+
+          # 2. 生成"单源校验专用" schema（剥离 required），三个配置源分别校验
+          #    （BASE/OVERRIDE 为空视为 {}；避免 required 写在全局时让 {} 之类的合法空源误中止）
+          with open(SOURCE_SCHEMA_FILE, "w") as f:
+              json.dump(strip_required(schema_obj), f)
+          base_cfg = parse_json(get("BASE_CONFIG") or "{}", "BASE_CONFIG")
+          override_cfg = parse_json(get("OVERRIDE_CONFIG") or "{}", "OVERRIDE_CONFIG")
+          matrix_list = parse_json(matrix_str, "BUILD_MATRIX")
+
+          if not isinstance(base_cfg, dict):
+              fail("❌ 错误：vars.BASE_CONFIG 必须是 JSON 对象！")
+          if not isinstance(override_cfg, dict):
+              fail("❌ 错误：vars.OVERRIDE_CONFIG 必须是 JSON 对象！")
+          if not isinstance(matrix_list, list) or not matrix_list:
+              fail("❌ 错误：vars.BUILD_MATRIX 必须是非空的 JSON 数组！")
+
+          validate_instance(base_cfg, "BASE_CONFIG", SOURCE_SCHEMA_FILE)
+          validate_instance(override_cfg, "OVERRIDE_CONFIG", SOURCE_SCHEMA_FILE)
+          for idx, item in enumerate(matrix_list):
+              if not isinstance(item, dict):
+                  fail(f"❌ 错误：vars.BUILD_MATRIX [{idx}] 不是 JSON 对象！")
+              validate_instance(item, "BUILD_MATRIX", SOURCE_SCHEMA_FILE, idx)
+
+          # 3. 三级合并：仅 schema properties 声明的键参与（键序规范化）；
+          #    若 schema 未设 additionalProperties:false，多余的键在此被丢弃并显式告警（不静默）
+          properties = sorted(schema_obj.get("properties", {}))
+          final_matrix = []
+          for item_index, item in enumerate(matrix_list):
+              known = set(base_cfg) | set(item) | set(override_cfg)
+              dropped = sorted(known - set(properties))
+              if dropped:
+                  target = f"{item.get('name', '未命名')}:{item.get('tag', '未指定tag')}"
+                  print(f"⚠️  警告：镜像 {target} 的以下键不在 schema.properties 中，已被忽略: {dropped}。"
+                        f"（schema 未设 additionalProperties:false 时多余键不会报错，只会丢弃）")
+
+              merged = {}
+              for k in properties:
+                  for cfg in (base_cfg, item, override_cfg):
+                      if k in cfg:
+                          merged[k] = cfg[k]
+
+              # 合并后必填项中止（内置硬底线，不依赖 schema 是否写 required）
+              missing = [k for k in REQUIRED_KEYS if merged.get(k) is None or str(merged[k]).strip() == ""]
+              if missing:
+                  target = f"{merged.get('name', '未命名')}:{merged.get('tag', '未指定tag')}"
+                  fail(f"❌ 中止：镜像 '{target}' 合并后缺少必填参数: {missing}。请检查 BASE_CONFIG / BUILD_MATRIX / OVERRIDE_CONFIG！")
+
+              # 合并后用原始 schema 复校：跨源合成的配置整体也要符合用户的 schema 规则（含 required）
+              validate_instance(merged, f"BUILD_MATRIX[{item_index}]", SCHEMA_FILE)
+
+              # 4. dockerfile_fragment → 单行 base64，供 build job 安全拼接
+              fragment = merged.pop("dockerfile_fragment", None)
+              b64 = ""
+              if fragment is not None:
+                  lines = [l.strip() for l in fragment if l.strip()]
+                  if not lines:
+                      fail(f"❌ 中止：镜像 '{merged.get('name')}:{merged.get('tag')}' 声明了 dockerfile_fragment 但清洗后为空，指令数组没有任何有效内容。")
+                  b64 = base64.b64encode("\n".join(lines).encode()).decode()
+              merged["dockerfile_fragment_b64"] = b64
+              merged["has_fragment"] = "true" if b64 else "false"
+
+              final_matrix.append(merged)
+
+          compact = json.dumps(final_matrix, separators=(",", ":"))
+          out = os.environ.get("GITHUB_OUTPUT")
+          if out:
+              with open(out, "a") as f:
+                  f.write(f"matrix={compact}\n")
+          print(f"✅ schema 校验 + 三级合并完成，共 {len(final_matrix)} 个镜像构建配置。")
+          PEOF
+
+  # ---- 2. 动态矩阵并发构建 ----
+  build:
+    name: build (${{ matrix.name }}:${{ matrix.tag }})
+    needs: prepare
+    runs-on: ubuntu-latest
+    strategy:
+      fail-fast: false
+      matrix:
+        include: ${{ fromJson(needs.prepare.outputs.matrix) }}
+
+    steps:
+      - name: Checkout
+        uses: actions/checkout@v7
+        with:
+          persist-credentials: false
+
+      - name: Set up Docker Buildx
+        uses: docker/setup-buildx-action@v4
+        with:
+          version: latest
+
+      - name: Login to ACR
+        uses: docker/login-action@v3
+        with:
+          registry: ${{ vars.ACR_REGISTRY }}
+          username: ${{ secrets.ACR_USERNAME }}
+          password: ${{ secrets.ACR_PASSWORD }}
+
+      - name: Compose Fragment Dockerfile
+        env:
+          HAS_FRAGMENT: ${{ matrix.has_fragment }}
+          FRAGMENT_B64: ${{ matrix.dockerfile_fragment_b64 }}
+        run: |
+          set -eu
+          if [ "${HAS_FRAGMENT}" = "true" ]; then
+            {
+              cat Dockerfile
+              echo ""
+              echo "# ---- Composed from vars.BUILD_MATRIX dockerfile_fragment ----"
+              echo "$FRAGMENT_B64" | base64 -d
+              echo ""   # 补尾换行：base64 源串无末尾 \n 时防止粘连
+            } > Dockerfile.fragment
+            echo "--- 拼接后的 Dockerfile.fragment 末尾 ---"
+            tail -n 20 Dockerfile.fragment
+          else
+            echo "无 dockerfile_fragment，使用仓库原始 Dockerfile。"
+          fi
+
+      - name: Build and push
+        timeout-minutes: ${{ fromJSON(env.BUILD_TIMEOUT_MINUTES) }}
+        uses: docker/build-push-action@v7
+        with:
+          context: .
+          file: ${{ matrix.has_fragment == 'true' && 'Dockerfile.fragment' || 'Dockerfile' }}
+          platforms: linux/amd64
+          push: true
+          provenance: false
+          sbom: false
+          tags: >-
+            ${{ vars.ACR_REGISTRY }}/${{ vars.ACR_NAMESPACE }}/${{ matrix.name }}:${{ matrix.tag }}
+          build-args: |
+            BASE_IMAGE=${{ matrix.base_image }}
+            DEV_USER=${{ matrix.dev_user }}
+            DEV_UID=${{ matrix.dev_uid }}
+            DEV_GID=${{ matrix.dev_gid }}
+            BASE_PACKAGES=${{ matrix.base_packages || '' }}
+            INSTALL_NODE=${{ matrix.install_node != '' && matrix.install_node || 'true' }}
+            NPM_ALLOW_SCRIPTS=${{ matrix.npm_allow_scripts || '' }}
+            NPM_GLOBAL_PACKAGES=${{ matrix.npm_global_packages || '' }}
+            PIP_GLOBAL_PACKAGES=${{ matrix.pip_global_packages || '' }}

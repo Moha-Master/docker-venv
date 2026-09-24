@@ -1,0 +1,7 @@
+# 不进 build context：仓库元数据、运行期数据、与镜像无关的文件
+.git
+.gitignore
+workspace
+Makefile
+*.md
+.env

@@ -1,0 +1,7 @@
+# Local Environment Overrides
+.env
+.env.local
+.env.*.local
+
+# Runtime Data
+workspace/

@@ -1,0 +1,24 @@
+services:
+  dev:
+    image: ${ACR_REGISTRY}/${ACR_NAMESPACE}/${IMAGE_NAME}:${IMAGE_TAG}
+    container_name: docker-venv
+    hostname: docker-venv
+    user: "${DEV_UID:-1000}:${DEV_GID:-1000}"
+    working_dir: /workspace
+    environment:
+      TZ: ${TZ:-Asia/Shanghai}
+      LANG: ${LANG:-C.UTF-8}
+      HOME: /home/${DEV_USER:-dev}
+    volumes:
+      - /etc/localtime:/etc/localtime:ro
+      - /etc/timezone:/etc/timezone:ro
+      - ./workspace:/workspace
+      - apt-cache:/var/cache/apt
+    cpus: ${CPUS:-0}
+    mem_limit: ${MEM_LIMIT:-0}
+    tty: true
+    stdin_open: true
+    restart: "no"
+
+volumes:
+  apt-cache:

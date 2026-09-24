@@ -1,0 +1,21 @@
+[user]
+    name = Moha-Master
+    email = hongkongreporter@outlook.com
+
+[filter "lfs"]
+    smudge = git-lfs smudge -- %f
+    process = git-lfs filter-process
+    required = true
+    clean = git-lfs clean -- %f
+
+[init]
+    defaultBranch = main
+
+[core]
+    eol = lf
+
+[url "https://ghproxy.xyz/https://github.com"]
+    insteadOf = https://github.com
+
+[credential]
+    helper = /usr/local/bin/git-credential
